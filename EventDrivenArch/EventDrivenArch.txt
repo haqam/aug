@@ -1,0 +1,958 @@
+Event-driven architecture in micro frontends
+1. Why it matters
+
+A micro frontend (MFE) setup splits one UI into apps that are built, deployed and owned separately. For example: a Shell, a Product Catalog (React), a Cart (Vue) and Checkout (Angular). They all run on one page, so they need to talk to each other. For example, “a product was added, so update the cart badge.”
+
+If the MFEs call each other directly (cartApp.addItem()), they become tightly coupled. They have to deploy together, share versions and know each other’s internals, which defeats the reason for splitting them up.
+
+Event-driven architecture (EDA) fixes this. MFEs never call each other. They publish facts (“this happened”) and subscribe to the facts they care about. The only thing they share is the event contract.
+
+┌──────────────────────────── Browser page ─────────────────────────────┐
+│                                                                       │
+│  ┌──────────┐   product:added    ┌──────────────┐                     │
+│  │ Catalog  │ ─────────────────▶ │              │ ──▶ Cart (Vue)      │
+│  │ (React)  │                    │  Event Bus   │ ──▶ Header badge    │
+│  └──────────┘                    │ (contract +  │ ──▶ Analytics       │
+│  ┌──────────┐   user:logged-in   │  transport)  │                     │
+│  │  Auth    │ ─────────────────▶ │              │ ──▶ Every MFE       │
+│  └──────────┘                    └──────────────┘                     │
+└───────────────────────────────────────────────────────────────────────┘
+
+Core principles:
+
+Publishers don’t know who is listening. Catalog has no idea Cart exists.
+Events are past-tense facts, such as cart:item-added, not commands like addToCart.
+The contract is the API. Version it like a REST API.
+Each MFE owns its own state. Events carry notifications or data. They are not shared mutable state.
+2. Transport options
+Transport	Scope	Pros	Cons
+window + CustomEvent	Same document	Native, framework-agnostic, no shared library needed	No typing, no replay, global namespace
+EventTarget-based bus (shared module)	Same document	Typed, can add replay and middleware	Needs a single shared instance (e.g. Module Federation singleton)
+BroadcastChannel	Across tabs/windows of the same origin	Syncs logout or cart across tabs	Structured-clone data only, same origin only
+window.postMessage	Cross-origin iframes	Works with iframe-based MFEs	Must validate origin, more verbose
+Observable store (RxJS etc.)	Same document	Powerful operators, replay	Heavier, pushes RxJS onto every team
+
+The most common production setup is a small typed event bus built on native CustomEvent. It is published as a tiny contracts package, with a BroadcastChannel bridge for cross-tab events.
+
+3. Step 1: the event contract (shared package)
+
+This is the only thing MFEs share. Put it in its own package (e.g. @acme/mfe-events) with semver.
+
+// packages/mfe-events/src/contract.ts
+
+/** Every event has an envelope: metadata used for tracing and versioning. */
+export interface EventEnvelope<T extends keyof EventMap = keyof EventMap> {
+  type: T;
+  version: EventMap[T]['version'];
+  payload: EventMap[T]['payload'];
+  meta: {
+    id: string;            // unique event id (dedupe and tracing)
+    source: string;        // which MFE emitted it, e.g. "catalog"
+    timestamp: number;
+    correlationId?: string; // ties request/response pairs together
+  };
+}
+
+/** The single source of truth: event name → version + payload shape. */
+export interface EventMap {
+  'auth:logged-in':  { version: 1; payload: { userId: string; displayName: string } };
+  'auth:logged-out': { version: 1; payload: Record<string, never> };
+
+  'cart:item-added': {
+    version: 2;
+    payload: { sku: string; quantity: number; price: { amount: number; currency: string } };
+  };
+  'cart:updated':    { version: 1; payload: { itemCount: number; total: number } };
+
+  'nav:navigate':    { version: 1; payload: { path: string; replace?: boolean } };
+
+  // request/response pair (see section 7)
+  'user:profile-requested': { version: 1; payload: Record<string, never> };
+  'user:profile-provided':  { version: 1; payload: { userId: string; email: string } };
+}
+
+export type EventName = keyof EventMap;
+export type PayloadOf<T extends EventName> = EventMap[T]['payload'];
+
+Why the envelope? version lets you evolve payloads. source and id make debugging possible when ten teams emit events. correlationId supports request/response.
+
+4. Step 2: a typed event bus
+// packages/mfe-events/src/bus.ts
+import type { EventEnvelope, EventMap, EventName, PayloadOf } from './contract';
+
+type Handler<T extends EventName> = (event: EventEnvelope<T>) => void;
+
+interface BusOptions {
+  /** Keep the last event of each type so late-mounting MFEs get current state. */
+  replay?: EventName[];
+  debug?: boolean;
+}
+
+const DOM_PREFIX = 'mfe:';
+
+export class EventBus {
+  private target: EventTarget;
+  private lastEvents = new Map<EventName, EventEnvelope>();
+  private replayTypes: Set<EventName>;
+  private debug: boolean;
+
+  constructor(private source: string, opts: BusOptions = {}, target: EventTarget = window) {
+    this.target = target;
+    this.replayTypes = new Set(opts.replay ?? []);
+    this.debug = opts.debug ?? false;
+  }
+
+  publish<T extends EventName>(
+    type: T,
+    payload: PayloadOf<T>,
+    extra: { version?: EventMap[T]['version']; correlationId?: string } = {}
+  ): void {
+    const envelope: EventEnvelope<T> = {
+      type,
+      version: (extra.version ?? 1) as EventMap[T]['version'],
+      payload,
+      meta: {
+        id: crypto.randomUUID(),
+        source: this.source,
+        timestamp: Date.now(),
+        correlationId: extra.correlationId,
+      },
+    };
+
+    // Freeze so no subscriber can mutate what others receive.
+    Object.freeze(envelope.payload);
+    Object.freeze(envelope);
+
+    if (this.replayTypes.has(type)) this.lastEvents.set(type, envelope);
+    if (this.debug) console.debug(`[bus:${this.source}] →`, type, envelope);
+
+    this.target.dispatchEvent(new CustomEvent(DOM_PREFIX + type, { detail: envelope }));
+  }
+
+  /** Returns an unsubscribe function. ALWAYS call it on unmount. */
+  subscribe<T extends EventName>(
+    type: T,
+    handler: Handler<T>,
+    opts: { replay?: boolean; signal?: AbortSignal } = {}
+  ): () => void {
+    const listener = (e: Event) => {
+      const envelope = (e as CustomEvent<EventEnvelope<T>>).detail;
+      // Error isolation: one buggy MFE must not break the others' handlers.
+      try {
+        handler(envelope);
+      } catch (err) {
+        console.error(`[bus:${this.source}] handler for "${type}" threw`, err);
+      }
+    };
+
+    this.target.addEventListener(DOM_PREFIX + type, listener, { signal: opts.signal });
+
+    // Replay the last known value to late subscribers (sticky events).
+    if (opts.replay !== false && this.replayTypes.has(type)) {
+      const last = this.lastEvents.get(type) as EventEnvelope<T> | undefined;
+      if (last) queueMicrotask(() => listener(new CustomEvent('', { detail: last })));
+    }
+
+    return () => this.target.removeEventListener(DOM_PREFIX + type, listener);
+  }
+
+  once<T extends EventName>(type: T, timeoutMs = 5000): Promise<EventEnvelope<T>> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { off(); reject(new Error(`Timeout: ${type}`)); }, timeoutMs);
+      const off = this.subscribe(type, (e) => { clearTimeout(timer); off(); resolve(e); }, { replay: false });
+    });
+  }
+}
+
+The replay problem: each per-instance lastEvents map above is private to its own bus. If every MFE creates new EventBus('cart'), replay won’t work across them. There are two fixes:
+
+Shared singleton via Module Federation. Mark @acme/mfe-events as singleton: true so every MFE gets the same module instance.
+Store replay state on window, which is framework- and bundler-agnostic:
+// packages/mfe-events/src/index.ts
+import { EventBus } from './bus';
+
+declare global { interface Window { __MFE_BUS_STATE__?: Map<string, unknown> } }
+
+/** Each MFE gets its own facade (for `source` tagging) over one shared replay store. */
+export function createBus(source: string) {
+  window.__MFE_BUS_STATE__ ??= new Map();
+  return new EventBus(source, { replay: ['auth:logged-in', 'cart:updated'], debug: import.meta.env.DEV });
+}
+// (In EventBus, replace `this.lastEvents` with `window.__MFE_BUS_STATE__`.)
+
+Module Federation config for the singleton approach:
+
+// webpack.config.js (each MFE + shell)
+new ModuleFederationPlugin({
+  name: 'cart',
+  shared: {
+    '@acme/mfe-events': { singleton: true, requiredVersion: '^2.0.0' },
+  },
+});
+5. Step 3: using it in each framework
+
+The bus is framework-agnostic. Each team writes a thin adapter.
+
+React (Catalog MFE)
+// catalog/src/bus.ts
+import { createBus } from '@acme/mfe-events';
+export const bus = createBus('catalog');
+
+// catalog/src/hooks/useEvent.ts
+import { useEffect, useRef } from 'react';
+import type { EventName, EventEnvelope } from '@acme/mfe-events';
+import { bus } from '../bus';
+
+export function useEvent<T extends EventName>(type: T, handler: (e: EventEnvelope<T>) => void) {
+  const ref = useRef(handler);
+  ref.current = handler; // always call latest handler without re-subscribing
+  useEffect(() => bus.subscribe(type, (e) => ref.current(e)), [type]);
+}
+
+// catalog/src/ProductCard.tsx
+export function ProductCard({ product }: { product: Product }) {
+  const [user, setUser] = useState<string | null>(null);
+  useEvent('auth:logged-in', (e) => setUser(e.payload.displayName));
+  useEvent('auth:logged-out', () => setUser(null));
+
+  const add = () =>
+    bus.publish('cart:item-added',
+      { sku: product.sku, quantity: 1, price: { amount: product.price, currency: 'USD' } },
+      { version: 2 });
+
+  return (
+    <div className="card">
+      <h3>{product.name}</h3>
+      <button onClick={add} disabled={!user}>Add to cart</button>
+    </div>
+  );
+}
+Vue 3 (Cart MFE)
+// cart/src/composables/useEvent.ts
+import { onMounted, onUnmounted } from 'vue';
+import type { EventName, EventEnvelope } from '@acme/mfe-events';
+import { bus } from '../bus';
+
+export function useEvent<T extends EventName>(type: T, handler: (e: EventEnvelope<T>) => void) {
+  let off: () => void;
+  onMounted(() => { off = bus.subscribe(type, handler); });
+  onUnmounted(() => off?.());
+}
+<!-- cart/src/CartWidget.vue -->
+<script setup lang="ts">
+import { ref, computed } from 'vue';
+import { useEvent } from './composables/useEvent';
+import { bus } from './bus';
+
+const items = ref<{ sku: string; qty: number; amount: number }[]>([]);
+
+useEvent('cart:item-added', (e) => {
+  // Version tolerance: handle old and new payload shapes.
+  const p = e.payload as any;
+  const amount = e.version >= 2 ? p.price.amount : p.price; // v1 had price: number
+  const existing = items.value.find((i) => i.sku === p.sku);
+  existing ? (existing.qty += p.quantity) : items.value.push({ sku: p.sku, qty: p.quantity, amount });
+
+  // Cart OWNS cart state; it announces the result for everyone else.
+  bus.publish('cart:updated', {
+    itemCount: items.value.reduce((n, i) => n + i.qty, 0),
+    total: items.value.reduce((t, i) => t + i.qty * i.amount, 0),
+  });
+});
+
+useEvent('auth:logged-out', () => { items.value = []; });
+const count = computed(() => items.value.length);
+</script>
+
+<template><aside>🛒 {{ count }} line items</aside></template>
+Angular (Checkout MFE): wrap the bus as an RxJS Observable
+// checkout/src/app/event-bus.service.ts
+import { Injectable, NgZone } from '@angular/core';
+import { Observable } from 'rxjs';
+import { createBus, EventName, EventEnvelope, PayloadOf } from '@acme/mfe-events';
+
+@Injectable({ providedIn: 'root' })
+export class EventBusService {
+  private bus = createBus('checkout');
+  constructor(private zone: NgZone) {}
+
+  on$<T extends EventName>(type: T): Observable<EventEnvelope<T>> {
+    return new Observable((sub) =>
+      // Events arrive from outside Angular: re-enter the zone so change detection runs.
+      this.bus.subscribe(type, (e) => this.zone.run(() => sub.next(e)))
+    ); // returned unsubscribe fn becomes teardown automatically
+  }
+
+  emit<T extends EventName>(type: T, payload: PayloadOf<T>) { this.bus.publish(type, payload); }
+}
+
+// checkout.component.ts
+@Component({ selector: 'app-checkout', template: `Total: {{ (cart$ | async)?.payload.total }}` })
+export class CheckoutComponent {
+  cart$ = this.events.on$('cart:updated'); // async pipe handles unsubscribe
+  constructor(private events: EventBusService) {}
+}
+Shell (vanilla): routing via events
+// shell/src/main.ts
+import { createBus } from '@acme/mfe-events';
+const bus = createBus('shell');
+
+// MFEs never touch the shell's router. They request navigation via an event.
+bus.subscribe('nav:navigate', ({ payload }) => {
+  payload.replace ? history.replaceState({}, '', payload.path) : history.pushState({}, '', payload.path);
+  renderRoute(payload.path);
+});
+
+bus.subscribe('cart:updated', ({ payload }) => {
+  document.querySelector('#cart-badge')!.textContent = String(payload.itemCount);
+});
+6. Cross-tab sync with BroadcastChannel
+
+Logging out in one tab should log out every tab. A bridge forwards selected events.
+
+// packages/mfe-events/src/cross-tab.ts
+import type { EventBus } from './bus';
+import type { EventName, EventEnvelope } from './contract';
+
+export function bridgeAcrossTabs(bus: EventBus, types: EventName[]) {
+  const channel = new BroadcastChannel('acme-mfe-bus');
+  const seen = new Set<string>(); // prevent echo loops
+
+  // local → other tabs
+  const offs = types.map((t) =>
+    bus.subscribe(t, (e) => {
+      if (seen.has(e.meta.id)) return;
+      seen.add(e.meta.id);
+      channel.postMessage(e);
+    }, { replay: false })
+  );
+
+  // other tabs → local
+  channel.onmessage = ({ data }: MessageEvent<EventEnvelope>) => {
+    if (!types.includes(data.type) || seen.has(data.meta.id)) return;
+    seen.add(data.meta.id);
+    window.dispatchEvent(new CustomEvent('mfe:' + data.type, { detail: data }));
+  };
+
+  return () => { offs.forEach((off) => off()); channel.close(); };
+}
+
+// shell only (bridge once, not per MFE):
+bridgeAcrossTabs(bus, ['auth:logged-out', 'cart:updated']);
+7. Request/response over events
+
+Sometimes an MFE needs data that another MFE owns. Don’t import it. Ask for it with a correlation id:
+
+// requester (Checkout)
+async function getProfile() {
+  const correlationId = crypto.randomUUID();
+  const reply = new Promise((resolve, reject) => {
+    const t = setTimeout(() => { off(); reject(new Error('No profile provider')); }, 3000);
+    const off = bus.subscribe('user:profile-provided', (e) => {
+      if (e.meta.correlationId !== correlationId) return; // not our reply
+      clearTimeout(t); off(); resolve(e.payload);
+    }, { replay: false });
+  });
+  bus.publish('user:profile-requested', {}, { correlationId });
+  return reply;
+}
+
+// responder (Account MFE)
+bus.subscribe('user:profile-requested', (e) => {
+  bus.publish('user:profile-provided', { userId: 'u1', email: 'a@b.com' },
+    { correlationId: e.meta.correlationId });
+});
+
+Use this sparingly. If MFEs constantly ask each other for data, the boundaries are probably wrong, or the data belongs in a shared backend API.
+
+8. Contract governance and versioning
+
+This is where EDA in MFEs usually succeeds or fails.
+
+Runtime validation: TypeScript types disappear at runtime, and MFEs deploy independently, so a publisher can ship a breaking payload without warning. Validate at the boundary:
+
+import { z } from 'zod';
+
+const schemas = {
+  'cart:item-added': z.object({
+    sku: z.string(),
+    quantity: z.number().int().positive(),
+    price: z.object({ amount: z.number(), currency: z.string().length(3) }),
+  }),
+} satisfies Partial<Record<EventName, z.ZodTypeAny>>;
+
+// inside publish(), in dev/staging (or always, for critical events):
+const schema = schemas[type as keyof typeof schemas];
+if (schema) {
+  const r = schema.safeParse(payload);
+  if (!r.success) { console.error(`Invalid "${type}" payload`, r.error.format()); return; }
+}
+
+Versioning rules:
+
+Additive changes (a new optional field) don’t need a version bump.
+Breaking changes: bump version, and publish both versions during a migration window, or have consumers tolerate both (as the Vue cart does above).
+Treat events like a public API: document them, list who consumes each one, and deprecate before removing.
+Run consumer-driven contract tests in CI (see below).
+9. Testing
+// Unit-test an MFE in isolation: the bus is the only seam you need to fake.
+import { EventBus } from '@acme/mfe-events';
+
+test('cart publishes cart:updated after item added', () => {
+  const target = new EventTarget();               // isolated, no window pollution
+  const bus = new EventBus('test', {}, target);
+  const received: any[] = [];
+  bus.subscribe('cart:updated', (e) => received.push(e.payload));
+
+  mountCart({ bus });                              // inject bus into the MFE
+  bus.publish('cart:item-added',
+    { sku: 'A1', quantity: 2, price: { amount: 10, currency: 'USD' } }, { version: 2 });
+
+  expect(received.at(-1)).toEqual({ itemCount: 2, total: 20 });
+});
+
+// Contract test: every consumer's fixture must pass the shared schema.
+test.each(Object.entries(consumerFixtures))('fixture %s matches contract', (type, payload) => {
+  expect(schemas[type].safeParse(payload).success).toBe(true);
+});
+
+Design tip: let each MFE receive the bus via injection (mount(el, { bus })) instead of importing a global. That makes tests and storybooks easy.
+
+10. Observability
+// Shell-level dev tool: log every bus event (attach once).
+if (import.meta.env.DEV) {
+  const orig = EventTarget.prototype.dispatchEvent;
+  window.dispatchEvent = function (e: Event) {
+    if (e.type.startsWith('mfe:')) {
+      const { type, meta, payload } = (e as CustomEvent).detail;
+      console.groupCollapsed(`%c${type}%c from ${meta.source}`, 'color:#0a0', 'color:gray');
+      console.log(payload); console.groupEnd();
+    }
+    return orig.call(this, e);
+  };
+}
+
+In production, sample key events into your analytics or RUM tool and tag them with meta.source and meta.id. When something breaks, you can then trace which MFE emitted what.
+
+11. Anti-patterns to avoid
+Anti-pattern	Why it hurts	Instead
+Commands disguised as events (cart:add-item that Cart must handle)	Hidden coupling: the publisher depends on a specific consumer	Publish facts (product:selected). If you truly need a command, document it as one with a single owner.
+Shared global store (one Redux store for all MFEs)	Distributed monolith: everyone deploys when the store shape changes	Each MFE owns its state and announces changes via events
+Huge payloads (passing whole domain objects)	Couples consumers to the publisher’s internal model	Send IDs + minimal data. Consumers fetch details from their own backend.
+Forgotten unsubscribes	Memory leaks and ghost handlers after MFE unmount/remount	Always return or call the unsubscribe function, or use AbortSignal
+Event chains / ping-pong (A→B→C→A)	Infinite loops, impossible to debug	Keep flows shallow and dedupe on meta.id
+Mutating payloads	One MFE corrupts what others see	Object.freeze, or structuredClone per subscriber
+No versioning	Independent deploys break each other silently	Envelope version + runtime schema validation
+Using events for everything	Over-engineering	Static config, auth tokens and design tokens can be shared modules or props from the shell
+12. Summary
+Contract package (EventMap + envelope + zod schemas) is the only shared dependency, versioned with semver.
+A tiny typed bus on native CustomEvent, with error isolation, freezing, replay for “state-like” events and unsubscribe functions.
+Thin framework adapters: React hook, Vue composable, Angular Observable service.
+The shell owns routing and the cross-tab bridge. MFEs request navigation through events.
+Governance: past-tense facts, minimal payloads, explicit versions, contract tests in CI and a dev-mode event logger.
+
+The main idea: events let MFEs work together without depending on each other. You give up compile-time coupling and get a runtime contract in return, so most of the work goes into versioning, validating and observing that contract.
+
+I can also turn this into a runnable demo project (shell + React + Vue MFEs with the bus) in this folder, or publish it as a shareable page for your team.
+
+How does this be applied in a Shell + MFEs in Angular 22v with Native Federation
+
+Event-driven Shell + MFEs in Angular 22 with Native Federation
+
+This builds on the bus from my previous answer and adapts it to an all-Angular setup:
+
+Native Federation (@angular-architects/native-federation): ESM plus import maps, built on the esbuild application builder.
+A dynamic host shell that lazy-loads remote routes and components.
+Standalone components, signals and zoneless change detection (zoneless is the default for new apps since v21).
+1. Angular is a special case: the remotes run inside the shell
+
+When the shell loads a remote’s routes with loadRemoteModule, the remote’s components run inside the shell’s Angular application. They share its platform, router and root injector. Angular is shared as a singleton, so this works.
+
+That gives you two ways for MFEs to communicate:
+
+	A. Shared Angular service (providedIn: 'root' in a shared lib)	B. Framework-agnostic event bus + Angular adapter (recommended)
+How	Shell and remotes inject the same service	MFEs publish and subscribe to a typed bus; signals wrap it
+Breaks when	The lib gets duplicated (version drift means two instances and split state). Also breaks for remotes mounted as Angular Elements or other frameworks.	Rarely. The bus anchors itself on globalThis, so even duplicated copies share one channel.
+Coupling	Implicit: anyone can call any method	Explicit: the event contract is the only API
+
+Use B, with an Angular-friendly API on top: mfeEventSignal(), onMfeEvent(), plus a per-MFE publisher.
+
+┌───────────────────────── Shell (:4200, dynamic host) ─────────────────────────┐
+│  Header ◀── mfeEventSignal('cart:updated')        Router ◀── 'nav:navigate'   │
+│  Auth   ──▶ publishes 'auth:session-changed' (sticky)                         │
+│                                                                               │
+│   <router-outlet>                                                             │
+│   ┌──── mfe-catalog (:4201) ────┐      ┌──── mfe-cart (:4202) ─────┐          │
+│   │ ProductCard                 │      │ CartStore (signals)       │          │
+│   │  publish 'cart:item-added' ─┼──┐   │  on 'cart:item-added'     │          │
+│   └─────────────────────────────┘  │   │  publish 'cart:updated' ──┼──▶ Header│
+│                                    ▼   └───────────────────────────┘          │
+│            @acme/mfe-events  (ONE instance via globalThis + NF sharing)       │
+└───────────────────────────────────────────────────────────────────────────────┘
+2. Workspace and Native Federation setup
+acme-portal/
+├─ projects/
+│  ├─ shell/          dynamic host  :4200
+│  ├─ mfe-catalog/    remote        :4201
+│  ├─ mfe-cart/       remote        :4202
+│  └─ mfe-events/     library: contract + core bus + Angular adapter
+└─ tsconfig.json      "paths": { "@acme/mfe-events": ["projects/mfe-events/src/public-api.ts"] }
+
+Generate the apps and the library with ng generate application … and ng generate library mfe-events, then add Native Federation. Use the native-federation version that matches your Angular major.
+
+ng add @angular-architects/native-federation --project shell --port 4200 --type dynamic-host
+ng add @angular-architects/native-federation --project mfe-catalog --port 4201 --type remote
+ng add @angular-architects/native-federation --project mfe-cart --port 4202 --type remote
+Remote federation.config.js
+// projects/mfe-cart/federation.config.js
+const { withNativeFederation, shareAll } = require('@angular-architects/native-federation/config');
+
+module.exports = withNativeFederation({
+  name: 'mfe-cart',
+  exposes: {
+    './routes':     './projects/mfe-cart/src/app/cart.routes.ts',
+    './CartWidget': './projects/mfe-cart/src/app/cart-widget.component.ts',
+  },
+  shared: {
+    // Angular, RxJS AND @acme/mfe-events (if consumed from npm) load once.
+    ...shareAll({ singleton: true, strictVersion: true, requiredVersion: 'auto' }),
+  },
+  skip: ['rxjs/ajax', 'rxjs/fetch', 'rxjs/testing', 'rxjs/webSocket'],
+});
+
+The shell’s config is the same, with name: 'shell' and no exposes.
+
+How the events lib gets shared:
+
+Monorepo: Native Federation automatically shares tsconfig path-mapped libraries, so @acme/mfe-events loads as one bundle for everyone. Nothing extra to do.
+Polyrepo: publish @acme/mfe-events to your npm registry. shareAll({ singleton: true }) covers it. Keep the major version aligned across teams.
+Shell bootstrap and manifest
+// projects/shell/src/main.ts
+import { initFederation } from '@angular-architects/native-federation';
+
+initFederation('federation.manifest.json')   // builds the import map from remoteEntry.json files
+  .catch((err) => console.error(err))
+  .then(() => import('./bootstrap'))          // Angular starts only after the import map exists
+  .catch((err) => console.error(err));
+// projects/shell/public/federation.manifest.json  (swap per environment at deploy time)
+{
+  "mfe-catalog": "http://localhost:4201/remoteEntry.json",
+  "mfe-cart":    "http://localhost:4202/remoteEntry.json"
+}
+3. The contract: model state-like events as one sticky event
+// projects/mfe-events/src/lib/contract.ts
+export interface EventMap {
+  // STATE-like: one event carrying the current state, replayed to late subscribers.
+  // (Better than separate logged-in / logged-out events, which make replay ambiguous.)
+  'auth:session-changed': { version: 1; payload: { user: { id: string; displayName: string } | null } };
+  'cart:updated':         { version: 1; payload: { itemCount: number; total: number } };
+
+  // FACT-like: one-off notifications, never replayed.
+  'cart:item-added': {
+    version: 2;
+    payload: { sku: string; quantity: number; price: { amount: number; currency: string } };
+  };
+  'nav:navigate': { version: 1; payload: { path: string; replace?: boolean } };
+}
+
+export const STICKY_EVENTS = ['auth:session-changed', 'cart:updated'] as const satisfies readonly EventName[];
+
+export type EventName = keyof EventMap;
+export type PayloadOf<T extends EventName> = EventMap[T]['payload'];
+export interface EventEnvelope<T extends EventName = EventName> {
+  type: T;
+  version: EventMap[T]['version'];
+  payload: PayloadOf<T>;
+  meta: { id: string; source: string; timestamp: number; correlationId?: string };
+}
+4. The core bus: no Angular code, resilient to duplicate copies
+
+The key Native Federation hardening is to anchor the bus state on globalThis with Symbol.for. If a version mismatch ever loads two copies of the library, both copies still use the same EventTarget and sticky cache.
+
+// projects/mfe-events/src/lib/core/bus.ts
+import { EventEnvelope, EventMap, EventName, PayloadOf, STICKY_EVENTS } from '../contract';
+
+const KEY = Symbol.for('acme.mfe-events.v1'); // bump only on breaking bus changes
+
+interface BusState { target: EventTarget; sticky: Map<EventName, EventEnvelope> }
+
+function state(): BusState {
+  const g = globalThis as any;
+  return (g[KEY] ??= { target: new EventTarget(), sticky: new Map() });
+}
+
+const sticky = new Set<EventName>(STICKY_EVENTS);
+
+export function publishAs<T extends EventName>(
+  source: string,
+  type: T,
+  payload: PayloadOf<T>,
+  opts: { version?: EventMap[T]['version']; correlationId?: string } = {},
+): void {
+  const envelope = Object.freeze({
+    type,
+    version: opts.version ?? 1,
+    payload: Object.freeze(structuredClone(payload)),   // no shared mutable references
+    meta: { id: crypto.randomUUID(), source, timestamp: Date.now(), correlationId: opts.correlationId },
+  }) as EventEnvelope<T>;
+
+  const s = state();
+  if (sticky.has(type)) s.sticky.set(type, envelope);
+  s.target.dispatchEvent(new CustomEvent(type, { detail: envelope }));
+}
+
+export function subscribe<T extends EventName>(
+  type: T,
+  handler: (e: EventEnvelope<T>) => void,
+  opts: { replay?: boolean } = {},
+): () => void {
+  const listener = (ev: Event) => {
+    try { handler((ev as CustomEvent<EventEnvelope<T>>).detail); }
+    catch (err) { console.error(`[mfe-events] handler for "${type}" threw`, err); } // isolate MFEs
+  };
+  const s = state();
+  s.target.addEventListener(type, listener);
+
+  if (opts.replay !== false) {
+    const last = s.sticky.get(type) as EventEnvelope<T> | undefined;
+    if (last) handler(last); // synchronous, so signals start with the right value
+  }
+  return () => s.target.removeEventListener(type, listener);
+}
+
+export const peek = <T extends EventName>(type: T) =>
+  state().sticky.get(type) as EventEnvelope<T> | undefined;
+
+/** Each MFE creates one publisher tagged with its name. */
+export const createPublisher = (source: string) => ({
+  publish: <T extends EventName>(type: T, payload: PayloadOf<T>, opts?: Parameters<typeof publishAs<T>>[3]) =>
+    publishAs(source, type, payload, opts),
+});
+
+/** Tests only. */
+export const resetBus = () => { delete (globalThis as any)[KEY]; };
+
+Because the core has no Angular dependency, the same package also works for a React or Vue remote, or an Angular Elements remote on a different Angular version.
+
+5. The Angular adapter: signals, auto-cleanup and RxJS interop
+// projects/mfe-events/src/lib/angular/mfe-events.angular.ts
+import { assertInInjectionContext, DestroyRef, inject, signal, Signal } from '@angular/core';
+import { Observable } from 'rxjs';
+import { EventEnvelope, EventName } from '../contract';
+import { peek, subscribe } from '../core/bus';
+
+/** Subscribe for the lifetime of the current component/service/route injector. */
+export function onMfeEvent<T extends EventName>(
+  type: T,
+  handler: (e: EventEnvelope<T>) => void,
+  opts?: { replay?: boolean },
+): void {
+  assertInInjectionContext(onMfeEvent);
+  const off = subscribe(type, handler, opts);
+  inject(DestroyRef).onDestroy(off); // no leaks when the remote route is navigated away
+}
+
+/** Latest value of an event as a read-only signal (seeded from sticky cache). */
+export function mfeEventSignal<T extends EventName>(type: T): Signal<EventEnvelope<T> | undefined> {
+  assertInInjectionContext(mfeEventSignal);
+  const s = signal<EventEnvelope<T> | undefined>(peek(type));
+  onMfeEvent(type, (e) => s.set(e), { replay: false });
+  return s.asReadonly();
+}
+
+/** For teams that prefer RxJS operators (debounce, switchMap, …). */
+export function mfeEvent$<T extends EventName>(type: T, replay = true): Observable<EventEnvelope<T>> {
+  return new Observable((sub) => subscribe(type, (e) => sub.next(e), { replay }));
+}
+
+Why zoneless helps: the bus dispatches outside any Angular API. With zone.js you would need NgZone.run(). In a zoneless app, setting a signal schedules change detection, so mfeEventSignal updates the UI with no extra work. The flip side: in zoneless apps, never assign plain class fields inside handlers. Always go through a signal.
+
+6. The shell
+// projects/shell/src/app/events.ts
+import { createPublisher } from '@acme/mfe-events';
+export const events = createPublisher('shell');
+// projects/shell/src/app/app.routes.ts
+import { Routes } from '@angular/router';
+import { loadRemoteModule } from '@angular-architects/native-federation';
+
+export const routes: Routes = [
+  { path: '', pathMatch: 'full', redirectTo: 'catalog' },
+  { path: 'catalog', loadChildren: () => loadRemoteModule('mfe-catalog', './routes').then((m) => m.CATALOG_ROUTES) },
+  { path: 'cart',    loadChildren: () => loadRemoteModule('mfe-cart', './routes').then((m) => m.CART_ROUTES) },
+];
+// projects/shell/src/app/app.config.ts
+import { ApplicationConfig, inject, provideAppInitializer, provideBrowserGlobalErrorListeners } from '@angular/core';
+import { provideRouter, Router } from '@angular/router';
+import { subscribe } from '@acme/mfe-events';
+import { routes } from './app.routes';
+import { AuthService } from './auth.service';
+import { bridgeAcrossTabs } from './cross-tab';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideBrowserGlobalErrorListeners(),
+    provideRouter(routes),
+    provideAppInitializer(() => {
+      const router = inject(Router);
+      // Remotes request navigation by logical path; they never touch the shell's Router API.
+      subscribe('nav:navigate', ({ payload }) =>
+        router.navigateByUrl(payload.path, { replaceUrl: payload.replace }));
+
+      inject(AuthService).restoreSession();             // publishes auth:session-changed (sticky)
+      bridgeAcrossTabs(['auth:session-changed']);       // logout in one tab → all tabs
+    }),
+  ],
+};
+// projects/shell/src/app/auth.service.ts
+@Injectable({ providedIn: 'root' })
+export class AuthService {
+  restoreSession() {
+    const user = readUserFromToken();                   // your OIDC lib, etc.
+    events.publish('auth:session-changed', { user });
+  }
+  logout() {
+    clearTokens();
+    events.publish('auth:session-changed', { user: null });
+  }
+}
+Header: reacting to events, plus a remote component inside the shell’s layout
+// projects/shell/src/app/header.component.ts
+import { Component, computed, inject, resource } from '@angular/core';
+import { NgComponentOutlet } from '@angular/common';
+import { RouterLink } from '@angular/router';
+import { loadRemoteModule } from '@angular-architects/native-federation';
+import { mfeEventSignal } from '@acme/mfe-events';
+import { AuthService } from './auth.service';
+
+@Component({
+  selector: 'app-header',
+  imports: [RouterLink, NgComponentOutlet],
+  template: `
+    <nav>
+      <a routerLink="/catalog">Catalog</a>
+      <a routerLink="/cart">Cart
+        @if (count() > 0) { <span class="badge">{{ count() }}</span> }
+      </a>
+
+      @if (user(); as u) {
+        <span>Hi, {{ u.displayName }}</span>
+        <button (click)="auth.logout()">Log out</button>
+      }
+
+      <!-- Component exposed by mfe-cart, rendered in the shell's header -->
+      @if (cartWidget.value(); as cmp) { <ng-container *ngComponentOutlet="cmp" /> }
+      @if (cartWidget.error()) { <span class="muted">Cart unavailable</span> } <!-- fault isolation -->
+    </nav>
+  `,
+})
+export class HeaderComponent {
+  protected auth = inject(AuthService);
+  private session = mfeEventSignal('auth:session-changed');
+  private cart = mfeEventSignal('cart:updated');
+
+  user  = computed(() => this.session()?.payload.user ?? null);
+  count = computed(() => this.cart()?.payload.itemCount ?? 0);
+
+  cartWidget = resource({
+    loader: () => loadRemoteModule('mfe-cart', './CartWidget').then((m) => m.CartWidgetComponent),
+  });
+}
+7. Remote: mfe-catalog (publisher)
+// projects/mfe-catalog/src/app/events.ts
+export const events = createPublisher('catalog');
+// projects/mfe-catalog/src/app/catalog.routes.ts   ← exposed as './routes'
+export const CATALOG_ROUTES: Routes = [
+  { path: '', loadComponent: () => import('./catalog-page.component').then((m) => m.CatalogPage) },
+];
+// projects/mfe-catalog/src/app/product-card.component.ts
+@Component({
+  selector: 'catalog-product-card',
+  template: `
+    <h3>{{ product().name }}</h3>
+    <p>{{ product().price | currency }}</p>
+    <button (click)="add()" [disabled]="!loggedIn()">Add to cart</button>
+    <button (click)="goToCart()">View cart</button>
+  `,
+  imports: [CurrencyPipe],
+})
+export class ProductCardComponent {
+  product = input.required<Product>();
+  private session = mfeEventSignal('auth:session-changed');
+  loggedIn = computed(() => !!this.session()?.payload.user);
+
+  add() {
+    const p = this.product();
+    events.publish('cart:item-added',
+      { sku: p.sku, quantity: 1, price: { amount: p.price, currency: 'USD' } },
+      { version: 2 });
+  }
+  goToCart() { events.publish('nav:navigate', { path: '/cart' }); }
+}
+
+Catalog has no import from mfe-cart, and no knowledge that a header badge exists.
+
+8. Remote: mfe-cart (consumer and state owner)
+// projects/mfe-cart/src/app/cart.store.ts
+import { computed, effect, Injectable, signal } from '@angular/core';
+import { onMfeEvent } from '@acme/mfe-events';
+import { events } from './events'; // createPublisher('cart')
+
+interface CartLine { sku: string; qty: number; amount: number }
+
+@Injectable({ providedIn: 'root' }) // one store shared by ./routes and ./CartWidget
+export class CartStore {
+  private readonly _lines = signal<CartLine[]>([]);
+  readonly lines = this._lines.asReadonly();
+  readonly count = computed(() => this._lines().reduce((n, l) => n + l.qty, 0));
+  readonly total = computed(() => this._lines().reduce((t, l) => t + l.qty * l.amount, 0));
+
+  constructor() {
+    onMfeEvent('cart:item-added', (e) => {
+      // Version tolerance: an older catalog may still emit v1 (price: number).
+      const p = e.payload as any;
+      const amount = e.version >= 2 ? p.price.amount : p.price;
+      this._lines.update((lines) => {
+        const hit = lines.find((l) => l.sku === p.sku);
+        return hit
+          ? lines.map((l) => (l === hit ? { ...l, qty: l.qty + p.quantity } : l))
+          : [...lines, { sku: p.sku, qty: p.quantity, amount }];
+      });
+    });
+
+    onMfeEvent('auth:session-changed', (e) => {
+      if (!e.payload.user) this._lines.set([]);
+    });
+
+    // Cart OWNS cart state and announces it (sticky) whenever the derived values change.
+    effect(() => events.publish('cart:updated', { itemCount: this.count(), total: this.total() }));
+  }
+
+  remove(sku: string) { this._lines.update((ls) => ls.filter((l) => l.sku !== sku)); }
+}
+// projects/mfe-cart/src/app/cart-widget.component.ts   ← exposed as './CartWidget'
+@Component({
+  selector: 'cart-widget',
+  template: `🛒 {{ store.count() }} · {{ store.total() | currency }}`,
+  imports: [CurrencyPipe],
+})
+export class CartWidgetComponent { protected store = inject(CartStore); }
+
+Why providedIn: 'root' works here: ./routes and ./CartWidget come from the same remote build, so they share the CartStore class and get one instance from the shell’s root injector. That is fine inside one MFE. Never inject another MFE’s services. That is the coupling the bus exists to prevent.
+
+Running a remote on its own (port 4202, no shell)
+
+When the shell loads a remote, only its exposed modules run. The remote’s own main.ts and app.config.ts run only in standalone dev mode, so that is the right place for fake shell events:
+
+// projects/mfe-cart/src/app/app.config.ts   (standalone mode only)
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideRouter(CART_ROUTES),
+    provideAppInitializer(() => {
+      if (isDevMode()) publishAs('dev-harness', 'auth:session-changed', { user: { id: 'dev', displayName: 'Dev User' } });
+    }),
+  ],
+};
+9. Cross-tab bridge (shell only)
+// projects/shell/src/app/cross-tab.ts
+import { EventEnvelope, EventName, publishAs, subscribe } from '@acme/mfe-events';
+
+export function bridgeAcrossTabs(types: EventName[]) {
+  const ch = new BroadcastChannel('acme-mfe-events');
+  const fromOtherTab = new Set<string>();
+
+  types.forEach((t) =>
+    subscribe(t, (e) => { if (!fromOtherTab.delete(e.meta.id)) ch.postMessage(e); }, { replay: false }));
+
+  ch.onmessage = ({ data }: MessageEvent<EventEnvelope>) => {
+    if (!types.includes(data.type)) return;
+    // Re-publish locally; mark it so we don't echo it back.
+    const before = crypto.randomUUID;
+    publishAs(data.meta.source, data.type, data.payload as any, { correlationId: data.meta.id });
+  };
+}
+
+To keep it simple, the echo guard can also key on correlationId === original id. The important rules are: bridge once, only in the shell, and only for selected events.
+
+10. Pitfalls specific to Angular and Native Federation
+Pitfall	Symptom	Fix
+Two copies of the events lib (version drift, or the lib missing from shared)	Header never updates, though the cart publishes	singleton: true, strictVersion: true, plus the Symbol.for anchor on globalThis. Check in DevTools: globalThis[Symbol.for('acme.mfe-events.v1')] should be a single object.
+Remote built with a different Angular major	strictVersion errors, or broken DI	Upgrade in lockstep, or wrap that remote as an Angular Elements web component with its own Angular. The framework-agnostic bus still works across the boundary.
+Plain fields mutated in handlers (zoneless)	Data changes but the UI doesn’t	Always write to signals (mfeEventSignal, signal.set).
+Leaked subscriptions when leaving a remote route	Handlers fire for destroyed components	Use onMfeEvent/mfeEventSignal (tied to DestroyRef), or takeUntilDestroyed with mfeEvent$.
+Replay of stale facts	A one-off cart:item-added gets reprocessed on remount	Only state-like events are sticky. Facts are never replayed.
+Separate logged-in and logged-out events	Late subscribers replay “logged in” after logout	One sticky auth:session-changed with user: null.
+SSR / prerendering	The globalThis bus is shared across server requests, leaking state	Publish and subscribe only in the browser: isPlatformBrowser, afterNextRender, or skip the bus during server render.
+Remote unavailable (deploy outage)	The shell crashes on loadRemoteModule	Catch in loadChildren and route to a fallback component. Use resource().error() for widgets, as in the header.
+Remotes injecting shell services directly (it works, because they share the root injector)	Hidden coupling, so both must deploy together	Lint rule: remotes may import only @acme/mfe-events and shared UI libs, never shell/* or mfe-*/*. Nx enforce-module-boundaries handles this well.
+11. Testing a remote in isolation
+// projects/mfe-cart/src/app/cart.store.spec.ts
+import { TestBed } from '@angular/core/testing';
+import { publishAs, resetBus, subscribe } from '@acme/mfe-events';
+import { CartStore } from './cart.store';
+
+describe('CartStore', () => {
+  beforeEach(() => resetBus());
+
+  it('aggregates items and publishes cart:updated', () => {
+    const store = TestBed.inject(CartStore);
+    const seen: unknown[] = [];
+    subscribe('cart:updated', (e) => seen.push(e.payload), { replay: false });
+
+    publishAs('test', 'cart:item-added', { sku: 'A1', quantity: 2, price: { amount: 10, currency: 'USD' } }, { version: 2 });
+    TestBed.tick(); // flush the effect that publishes cart:updated
+
+    expect(store.count()).toBe(2);
+    expect(seen.at(-1)).toEqual({ itemCount: 2, total: 20 });
+  });
+
+  it('clears on logout', () => {
+    const store = TestBed.inject(CartStore);
+    publishAs('test', 'cart:item-added', { sku: 'A1', quantity: 1, price: { amount: 5, currency: 'USD' } }, { version: 2 });
+    publishAs('test', 'auth:session-changed', { user: null });
+    expect(store.count()).toBe(0);
+  });
+});
+Summary
+Native Federation loads remote routes and components into the shell. Angular, RxJS and @acme/mfe-events are shared as singletons.
+The core bus has no framework code and is anchored on globalThis with Symbol.for, so it survives duplicate copies and works with web-component remotes.
+The Angular adapter connects events to signals (mfeEventSignal, onMfeEvent) with DestroyRef cleanup. Zoneless change detection then updates the UI automatically.
+The shell owns cross-cutting concerns: auth (a sticky state event), navigation (via nav:navigate), the cross-tab bridge and fault-tolerant remote loading.
+Each remote owns its state in signal stores and announces changes as events. Remotes never import each other.
+
+Two of the code blocks above need fixing before you copy them. In section 9, bridgeAcrossTabs has an unused leftover line (const before = crypto.randomUUID;), and its echo guard never records anything in the set it checks. As written, an event received from another tab gets posted straight back to the channel. To fix it, make publishAs accept a fixed event id and add that id to fromOtherTab before re-publishing. Also, structuredClone in publishAs will throw on payloads containing functions or class instances. That’s fine for plain JSON-style payloads like the ones in this contract.
+
+
+
+The scaffold is ready: acme-portal.zip, about 120 KB. The unzipped folder is also at acme-portal/. All 13 unit tests pass, all three apps build, and I clicked through the whole event flow in the browser:
+
+logging in in the shell enables the catalog’s buttons;
+adding items makes the cart total them, and the shell’s header badge and the cart widget update (3 items, $427);
+“View cart” switches the page to the cart;
+logging out empties the cart.
+
+To run it:
+
+npm install
+npm start
+
+Then open http://localhost:4200, click Log in, add products, and watch the Event bus log at the bottom of the page. npm test runs every project’s unit tests, and npm run start:cart runs the cart on its own with fake shell events.
+
+What’s inside:
+
+Project	Port	Role
+shell	4200	Handles login and routing, shows the cart widget in its header, plus a live event log
+mfe-catalog	4201	Publishes “item added” and “go to cart” events
+mfe-cart	4202	Owns the cart and announces its totals; exposes ./routes and ./CartWidget
+mfe-events	–	Event contract, the bus, signal helpers, cross-tab sync
+
+Where it differs from my earlier answer. I generated the project with the real ng add for Native Federation 22.2.2, and it doesn’t match some of what I described before:
+
+The config file is federation.config.mjs and uses fromPackageJson(...), not shareAll.
+The events library is a tsconfig path alias (@acme/mfe-events), which Native Federation shares as a single copy automatically. I checked that it’s listed in the built remoteEntry.json.
+
+Two problems testing caught:
+
+Header crash when the cart app is down. In Angular 22, reading resource.value() while the resource has failed throws an error, so the shell header would have crashed instead of showing “Cart unavailable”. It now checks hasValue() first. There’s a unit test for this case.
+Cross-tab echo. The cross-tab bridge I sketched earlier sent events back to the tab they came from. It now tracks the original event id so it doesn’t re-send them.
+
+If you have a PORT environment variable set, ng serve uses it for all three apps and the two remotes fail to start because the port is taken. Unset it before npm start; the README mentions this too.
